@@ -212,7 +212,7 @@ class Worker:
     Worker.ave_V_loss = Worker.ave_V_loss * (alpha) + (1 - alpha) * ep_v_loss
     Worker.ave_Pi_loss = Worker.ave_Pi_loss * (alpha) + (1 - alpha) * ep_Pi_loss
     Worker.ave_entropy = Worker.ave_entropy * (alpha) + (1 - alpha) * ep_entropy
-    Worker.ave_loss = Worker.ave_loss * (alpha) + (1 - alpha) * ave_loss
+    Worker.ave_loss = Worker.ave_loss * (alpha) + (1 - alpha) * ep_loss
     Worker.episode_rewards_lock.release()
     f = Worker.total_frames; 
     t = (time.time() - Worker.starttime)
