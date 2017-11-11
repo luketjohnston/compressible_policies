@@ -16,7 +16,6 @@ SAVE_NAME = SAVE_PATH + '/model.cpkt'
 TRAINING = True
 RESTORING = False
 RENDERING = False
-EPSILON_ANNEAL_FRAMES = 1e9 # paper was 4e9
 
 
 
@@ -100,7 +99,8 @@ class Model():
       self.v_loss = 0.5 * tf.nn.l2_loss(self.v - self.v_target) # 0.5 hyperparam from paper
 
       # RMSprop apply gradients expects gradients of the loss
-      self.grads = tf.gradients(self.pi_loss + self.v_loss - beta * self.entropy, self.var_list) # add opp to compute gradients
+      self.total_loss = self.pi_loss + self.v_loss - beta * self.entropy
+      self.grads = tf.gradients(self.total_loss, self.var_list) # add opp to compute gradients
       self.grads = [tf.clip_by_norm(g, 10) for g in self.grads]
 
       self.grad_inputs = [tf.placeholder(dtype=v.dtype, shape=v.shape) for v in self.var_list]
@@ -120,7 +120,7 @@ class Model():
   def compute_grads(self, states, actions, advantages, value_targets, sess):
     feed_dict = {self.s : states, self.action_taken : actions, 
         self.adv : advantages, self.v_target : value_targets}
-    return sess.run((self.grads,self.pi_loss,self.v_loss,self.entropy), feed_dict)
+    return sess.run((self.grads,self.total_loss,self.pi_loss,self.v_loss,self.entropy), feed_dict)
 
 
   #@profile
@@ -173,6 +173,7 @@ class Worker:
   ave_V_loss = 0 # average value function loss
   ave_Pi_loss = 0 # average policy loss
   ave_entropy = 0 # average entropy
+  ave_loss = 0 # average loss
   starttime = time.time()
   max_frames = 100000000
   last_save = 0
@@ -203,7 +204,7 @@ class Worker:
     Worker.frame_count_lock.release()
 
   #@profile
-  def updateEpisodeRewards(ep_R, ep_len, ep_v_loss, ep_Pi_loss, ep_entropy):
+  def updateEpisodeRewards(ep_R, ep_len, ep_v_loss, ep_Pi_loss, ep_entropy, ep_loss):
     alpha = 0.9 # blending factor to accumulate averages
     Worker.episode_rewards_lock.acquire()
     Worker.ave_ep_R = Worker.ave_ep_R * (alpha) + (1 - alpha) * ep_R
@@ -211,12 +212,13 @@ class Worker:
     Worker.ave_V_loss = Worker.ave_V_loss * (alpha) + (1 - alpha) * ep_v_loss
     Worker.ave_Pi_loss = Worker.ave_Pi_loss * (alpha) + (1 - alpha) * ep_Pi_loss
     Worker.ave_entropy = Worker.ave_entropy * (alpha) + (1 - alpha) * ep_entropy
+    Worker.ave_loss = Worker.ave_loss * (alpha) + (1 - alpha) * ave_loss
     Worker.episode_rewards_lock.release()
     f = Worker.total_frames; 
     t = (time.time() - Worker.starttime)
     fps = f / t
-    print("AER: %f, AEL: %f, V loss: %f, Pi Loss: %f, H: %f, Hrs: %f, FPS: %f, Frames: %d" 
-        % (Worker.ave_ep_R, Worker.ave_ep_len, Worker.ave_V_loss, Worker.ave_Pi_loss, Worker.ave_entropy, t/60/60,fps,f))
+    print("AER: %f, AEL: %f, Loss: %f, H: %f, Hrs: %f, FPS: %f, Frames: %d" 
+        % (Worker.ave_ep_R, Worker.ave_ep_len, Worker.ave_loss, Worker.ave_entropy, t/60/60,fps,f))
 
 
 
@@ -229,10 +231,12 @@ class Worker:
     v_losses = []
     pi_losses = []
     entropies = []
+    total_losses = []
     while Worker.total_frames < Worker.max_frames:
 
 
-      self.model.sync_from_global(Worker.sess)
+      if TRAINING:
+        self.model.sync_from_global(Worker.sess)
 
       # act in environment for awhile
       state_action_rewards = []
@@ -249,6 +253,8 @@ class Worker:
         action = np.random.choice(range(policy.shape[1]),p=policy[0])
         #print(action)
         # execute action in environment, receive transition and rewards
+        if RENDERING:
+          self.env.render()
         next_frame, last_reward, done, _ = self.env.step(action)
         # record data from this frame
         episode_rewards += last_reward
@@ -262,8 +268,9 @@ class Worker:
           ave_V_loss = sum(v_losses) / episode_frame_count
           ave_Pi_loss = sum(pi_losses) / episode_frame_count
           ave_entropy = sum(entropies) / episode_frame_count
+          ave_loss = sum(total_losses) / episode_frame_count
           Worker.updateEpisodeRewards(episode_rewards, episode_frame_count, 
-              ave_V_loss, ave_Pi_loss, ave_entropy)
+              ave_V_loss, ave_Pi_loss, ave_entropy, ave_loss)
           episode_rewards = 0
           episode_frame_count = 0
           v_losses = []; pi_losses = []; entropies = []
@@ -289,10 +296,11 @@ class Worker:
             for i,_ in enumerate(discounted_rewards)][:-1]
         advantages = [target - est for (est,target) in zip(value_ests, value_targets)]
 
-        grads,pi_loss,v_loss,entropy = self.model.compute_grads(states, actions, advantages, value_targets, Worker.sess)
+        grads,total_loss,pi_loss,v_loss,entropy = self.model.compute_grads(states, actions, advantages, value_targets, Worker.sess)
         v_losses.append(v_loss)
         pi_losses.append(pi_loss)
         entropies.append(entropy)
+        total_losses.append(total_loss)
         self.global_model.apply_gradients(grads,Worker.sess)
 
 
