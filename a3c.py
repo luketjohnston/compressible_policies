@@ -9,10 +9,15 @@ import gym
 from envs import create_atari_env
 
 FRAMES_FOR_INPUT = 4
-SAVE_STEP = 1000
+NUM_THREADS = 4
+SAVE_STEP = 100000
 SAVE_PATH = "/Users/lukejohnston/NEO/saves"
 SAVE_NAME = SAVE_PATH + '/model.cpkt'
-TRAINING = False
+TRAINING = True
+RESTORING = False
+RENDERING = False
+EPSILON_ANNEAL_FRAMES = 1e9 # paper was 4e9
+
 
 
 # given shape of input to convolutional layer and strides (and padding scheme),
@@ -31,7 +36,7 @@ class Model():
     with tf.variable_scope(scope):
       self.var_list = []
       input_shape = (None, 42, 42, 4)
-      self.s = tf.placeholder(dtype=tf.uint8, shape=input_shape)
+      self.s = tf.placeholder(dtype=tf.float32, shape=input_shape)
       self.adv = tf.placeholder(dtype=tf.float32, shape=[None])
       self.v_target = tf.placeholder(dtype=tf.float32, shape=[None])
       self.action_taken = tf.placeholder(dtype=tf.uint8, shape=[None])
@@ -43,9 +48,9 @@ class Model():
           initializer=tf.zeros_initializer())
       self.var_list += [W1,b1]
       strides1 = [1,4,4,1]; padding1='SAME'
-      x = tf.cast(self.s, tf.float32)
-      h = tf.nn.conv2d(x, W1, strides=strides1, padding=padding1) + b1
+      h = tf.nn.conv2d(self.s, W1, strides=strides1, padding=padding1) + b1
       h = tf.nn.relu(h)
+      self.h1 = h
       hshape = get_conv_out_shape(input_shape,strides1,padding1,16)
 
       # second conv layer
@@ -57,6 +62,7 @@ class Model():
       strides2 = [1,2,2,1]; padding2='SAME'
       h = tf.nn.conv2d(h, W2, strides=strides2, padding=padding2) + b2
       h = tf.nn.relu(h)
+      self.h2 = h
       hshape = get_conv_out_shape(hshape,strides2,padding2,32)
 
       # fully connected layer
@@ -81,21 +87,24 @@ class Model():
       pi_logits = h[:,:num_actions]
       self.pi = tf.nn.softmax(pi_logits)
 
-      beta = 0.01
-      entropy = - beta * tf.reduce_sum(self.pi * tf.log(self.pi)) # over all batch elements
 
       self.v = h[:,num_actions]
 
       action_onehot = tf.one_hot(self.action_taken, depth=num_actions)
-      pi_loss = - tf.reduce_sum(tf.log(self.pi * action_onehot), axis=1) * self.adv
-      # TODO entropy term
-      v_loss = tf.reduce_sum(tf.pow(self.v - self.v_target,2))
-      v_loss *= 0.5 # apparently paper does this
+      self.action_onehot = action_onehot
+      # Avoid NaN with clipping when value in pi becomes zero
+      log_pi = tf.log(tf.clip_by_value(self.pi, 1e-10, 1.0))
+      self.pi_loss = - tf.reduce_sum(log_pi * action_onehot * tf.expand_dims(self.adv, 1))
+      beta = 0.01
+      self.entropy = - tf.reduce_sum(self.pi * log_pi) 
+      self.v_loss = 0.5 * tf.nn.l2_loss(self.v - self.v_target) # 0.5 hyperparam from paper
 
-      self.grads = tf.gradients(- pi_loss - v_loss + entropy, self.var_list) # add opp to compute gradients
+      # RMSprop apply gradients expects gradients of the loss
+      self.grads = tf.gradients(self.pi_loss + self.v_loss - beta * self.entropy, self.var_list) # add opp to compute gradients
+      self.grads = [tf.clip_by_norm(g, 10) for g in self.grads]
 
       self.grad_inputs = [tf.placeholder(dtype=v.dtype, shape=v.shape) for v in self.var_list]
-      self.apply_grads = tf.train.RMSPropOptimizer(10e-3, use_locking=True).apply_gradients(zip(self.grad_inputs,self.var_list))
+      self.apply_grads = tf.train.RMSPropOptimizer(1e-3, decay=0.99, use_locking=True).apply_gradients(zip(self.grad_inputs,self.var_list))
 
 
       # copy parameters from model to self. Used to update local models with global.
@@ -111,18 +120,23 @@ class Model():
   def compute_grads(self, states, actions, advantages, value_targets, sess):
     feed_dict = {self.s : states, self.action_taken : actions, 
         self.adv : advantages, self.v_target : value_targets}
-    return sess.run(self.grads, feed_dict)
+    return sess.run((self.grads,self.pi_loss,self.v_loss,self.entropy), feed_dict)
 
 
   #@profile
   def get_policy_and_value(self, state, sess):
-    state = np.expand_dims(state, 0) # add batch axis (but a3c doesn't use batches)
+    state = np.expand_dims(state, 0) # add batch axis
     feed_dict = {self.s : state}
     return sess.run((self.pi, self.v),feed_dict)
+
+  def test(self, state, sess):
+    state = np.expand_dims(state, 0) # add batch axis
+    feed_dict = {self.s : state}
+    return sess.run((self.s, self.h1, self.h2, self.pi, self.v),feed_dict)
  
   #@profile
   def get_value(self, state, sess):
-    state = np.expand_dims(state, 0) # add batch axis (but a3c doesn't use batches)
+    state = np.expand_dims(state, 0) # add batch axis 
     feed_dict = {self.s : state}
     return sess.run(self.v,feed_dict)
 
@@ -145,15 +159,6 @@ def initEnv():
   state = env.reset()
   return env, state
 
-# to simplify, epsilon will stay the same over each episode
-def getEpsilon(total_frames):
-  r = random.random()
-  if r < 0.4:
-    return max(0.1, 1 - (1 - 0.1) / 4e9)
-  if r < 0.7:
-    return max(0.01, 1 - (1 - 0.01) / 4e9)
-  return max(0.5, 1 - (1 - 0.5) / 4e9)
-
 
 
 # will call from a bunch of different threads
@@ -163,7 +168,11 @@ class Worker:
   sess = None
   episode_rewards_lock = threading.Lock()
   episode_rewards = []
-  average_episode_reward = 0
+  ave_ep_R = -21 # average episode reward
+  ave_ep_len = 1000 # average episode length
+  ave_V_loss = 0 # average value function loss
+  ave_Pi_loss = 0 # average policy loss
+  ave_entropy = 0 # average entropy
   starttime = time.time()
   max_frames = 100000000
   last_save = 0
@@ -182,10 +191,10 @@ class Worker:
     self.state = np.concatenate((self.state, frame), axis = 2)
     self.state = self.state[:,:,1:] # remove memory from 5 frames ago
 
-  def startSession(num_threads):
-    Worker.sess = tf.Session(config=tf.ConfigProto(
-        intra_op_parallelism_threads=num_threads))
-    Worker.sess.run(tf.global_variables_initializer())
+  def startSession():
+    Worker.sess = tf.Session()
+    if TRAINING:
+      Worker.sess.run(tf.global_variables_initializer())
 
   #@profile
   def updateFrameCount(frames_to_add):
@@ -194,17 +203,22 @@ class Worker:
     Worker.frame_count_lock.release()
 
   #@profile
-  def updateEpisodeRewards(episode_reward):
-    er = Worker.episode_rewards
+  def updateEpisodeRewards(ep_R, ep_len, ep_v_loss, ep_Pi_loss, ep_entropy):
+    alpha = 0.9 # blending factor to accumulate averages
     Worker.episode_rewards_lock.acquire()
-    er.append(episode_reward)
-    Worker.average_episode_reward = sum(er[-20:]) / len(er[-20:])
+    Worker.ave_ep_R = Worker.ave_ep_R * (alpha) + (1 - alpha) * ep_R
+    Worker.ave_ep_len = Worker.ave_ep_len * (alpha) + (1 - alpha) * ep_len
+    Worker.ave_V_loss = Worker.ave_V_loss * (alpha) + (1 - alpha) * ep_v_loss
+    Worker.ave_Pi_loss = Worker.ave_Pi_loss * (alpha) + (1 - alpha) * ep_Pi_loss
+    Worker.ave_entropy = Worker.ave_entropy * (alpha) + (1 - alpha) * ep_entropy
     Worker.episode_rewards_lock.release()
-    f = Worker.total_frames; aer = Worker.average_episode_reward
+    f = Worker.total_frames; 
     t = (time.time() - Worker.starttime)
     fps = f / t
+    print("AER: %f, AEL: %f, V loss: %f, Pi Loss: %f, H: %f, Hrs: %f, FPS: %f, Frames: %d" 
+        % (Worker.ave_ep_R, Worker.ave_ep_len, Worker.ave_V_loss, Worker.ave_Pi_loss, Worker.ave_entropy, t/60/60,fps,f))
 
-    print("Frames: %d, AER: %f, Hours: %f, FPS: %f" % (f,aer,t/60/60,fps))
+
 
 
   #@profile
@@ -212,11 +226,12 @@ class Worker:
     # train
     episode_rewards = 0
     episode_frame_count = 0
-    epsilon = getEpsilon(Worker.total_frames)
+    v_losses = []
+    pi_losses = []
+    entropies = []
     while Worker.total_frames < Worker.max_frames:
 
 
-      # copy global variables to local graph
       self.model.sync_from_global(Worker.sess)
 
       # act in environment for awhile
@@ -230,10 +245,9 @@ class Worker:
         episode_frame_count += 1
         # use model to determine policy for current state, and then pick action
         policy, value = self.model.get_policy_and_value(self.state, Worker.sess)
-        if random.random() < epsilon:
-          action = self.env.action_space.sample()
-        else:
-          action = np.random.choice(range(num_actions),p=policy)
+        #print(policy)
+        action = np.random.choice(range(policy.shape[1]),p=policy[0])
+        #print(action)
         # execute action in environment, receive transition and rewards
         next_frame, last_reward, done, _ = self.env.step(action)
         # record data from this frame
@@ -244,19 +258,20 @@ class Worker:
         rewards.append(last_reward)
         self.updateState(next_frame)
         Worker.updateFrameCount(1)
-        #if episode_frame_count % 100 == 0:
-        #  print(episode_frame_count)
         if (done):
-          Worker.updateEpisodeRewards(episode_rewards)
+          ave_V_loss = sum(v_losses) / episode_frame_count
+          ave_Pi_loss = sum(pi_losses) / episode_frame_count
+          ave_entropy = sum(entropies) / episode_frame_count
+          Worker.updateEpisodeRewards(episode_rewards, episode_frame_count, 
+              ave_V_loss, ave_Pi_loss, ave_entropy)
           episode_rewards = 0
           episode_frame_count = 0
+          v_losses = []; pi_losses = []; entropies = []
           self.state = np.repeat(self.env.reset(), FRAMES_FOR_INPUT, axis=2) # first state is just start frame repeated FRAMES_FOR_INPUT times
-          epsilon = getEpsilon(Worker.total_frames)
-        if (self.ID == 0 and Worker.total_frames - Worker.last_save > SAVE_STEP and TRAINING):
+        if (self.ID == 0 and Worker.total_frames - Worker.last_save > SAVE_STEP):
           self.saver.save(self.sess, SAVE_NAME)
-          last_save = Worker.total_frames
-        if not TRAINING: # we are rendering
-          self.env.render()
+          Worker.last_save = Worker.total_frames
+
           
         
       # FOR MY ALGO, here we would have other predictor predict
@@ -272,16 +287,20 @@ class Worker:
         discounted_rewards = [r*gamma**i for i,r in enumerate(rewards)]
         value_targets = [sum(discounted_rewards[i:])/gamma**i 
             for i,_ in enumerate(discounted_rewards)][:-1]
-        advantages = [est - target for (est,target) in zip(value_ests, value_targets)]
+        advantages = [target - est for (est,target) in zip(value_ests, value_targets)]
 
-        grads = self.model.compute_grads(states, actions, advantages, value_targets, Worker.sess)
+        grads,pi_loss,v_loss,entropy = self.model.compute_grads(states, actions, advantages, value_targets, Worker.sess)
+        v_losses.append(v_loss)
+        pi_losses.append(pi_loss)
+        entropies.append(entropy)
         self.global_model.apply_gradients(grads,Worker.sess)
 
 
 
 
+
 def main():
-  num_threads = 4
+  num_threads = NUM_THREADS
   if not TRAINING: num_threads = 1
   tempEnv, _ = initEnv()
   num_actions = tempEnv.action_space.n
@@ -289,12 +308,18 @@ def main():
   # create global and local models
   global_model = Model('global',num_actions)
   # create saver now, so that it only saves global model
-  saver = tf.train.Saver()
-  thread_models = [Model(str(ID), num_actions, global_model) for ID in range(num_threads)]
-  # make a Worker instance for each worker
-  threads = [threading.Thread(target=Worker(ID,model,initEnv,global_model,saver).train) for ID,model in enumerate(thread_models)]
-  Worker.startSession(num_threads)
-  for t in threads: t.start()
+  saver = tf.train.Saver(tf.global_variables())
+  Worker.startSession()
+  if RESTORING:
+    saver.restore(Worker.sess, SAVE_NAME)
+  if TRAINING:
+    thread_models = [Model(str(ID), num_actions, global_model) for ID in range(num_threads)]
+    # make a Worker instance for each worker
+    threads = [threading.Thread(target=Worker(ID,model,initEnv,global_model,saver).train) for ID,model in enumerate(thread_models)]
+    for t in threads: t.start()
+  else:
+    w = Worker(0,global_model,initEnv,global_model,saver)
+    w.train()
 
 
 
